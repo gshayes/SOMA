@@ -18,7 +18,7 @@
 #' 
 #' * `p` p-value of test for heterogeneity
 #' @export
-fixed <- function(ES, SE, cor_mat) {
+somaf <- function(ES, SE, cor_mat) {
   
   # number of MAs
   k = length(ES)
@@ -92,7 +92,7 @@ fixed <- function(ES, SE, cor_mat) {
 #' 
 #' * `tau` measure of heterogeneity
 #' @export
-random <- function(ES, SE, cor_mat, iter, type) {
+somar <- function(ES, SE, cor_mat, iter, type) {
   
   # initial fixed-effect results from TDotFM
   fix_results  = fixed(ES, SE, cor_mat)
