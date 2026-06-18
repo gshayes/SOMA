@@ -5,7 +5,7 @@
 #'
 #' @param ES Effect sizes from the meta analyses
 #' @param SE Standard errors corresponding to the effect sizes
-#' @param cor_mat Covariance matrix of the effect sizes
+#' @param cor_mat Correlation matrix of the effect sizes
 #'
 #' @returns 
 #' * `Mean ES` mean effect size estimate
@@ -41,16 +41,16 @@ fixed <- function(ES, SE, cor_mat) {
   # solve for inverse Sigma
   Sig_inv = solve(Sig)
   
-  # compute mean effect size
+  # compute mean effect size (this is equation 44)
   mu_hat = (O_t %*% Sig_inv %*% ES) / (O_t %*% Sig_inv %*% O)
   
-  # compute variance of the estimator
+  # compute variance of the estimator (this is equation 45)
   V_mu_hat = 1 / (O_t %*% Sig_inv %*% O)
   
-  # compute standard error of the estimator
+  # compute standard error of the estimator 
   SE_mu_hat = sqrt(V_mu_hat)
   
-  # compute Q
+  # compute Q (this is equation 46)
   Q = t(ES) %*% Sig_inv %*% ES - (O_t %*% Sig_inv %*% ES)^2 / (O_t %*% Sig_inv %*% O)
   
   # compute degrees of freedom for chi-square distribution
@@ -75,7 +75,7 @@ fixed <- function(ES, SE, cor_mat) {
 #'
 #' @param ES Effect sizes from the meta analyses
 #' @param SE Standard errors corresponding to the effect sizes
-#' @param cor_mat Covariance matrix of the effect sizes
+#' @param cor_mat Correlation matrix of the effect sizes
 #' @param iter Number of iterations
 #' @param type ML or REML
 #'
@@ -132,13 +132,13 @@ random <- function(ES, SE, cor_mat, iter, type) {
     V_mu = 1 / (O_t %*% Sig_inv %*% O)
     W = O_t %*% Sig_inv
     
-    # REML correction term
+    # REML correction term (this is equation 53)
     REML_correction = 0
     if (type == "REML") {
       REML_correction = 1 / (W %*% O)
     }
     
-    # update tau^2 estimator
+    # update tau^2 estimator (this is equation 52)
     tau2 = sum(W^2 * ((ES - mu)^2 - SE^2)) / sum(W^2) + REML_correction
     
     # update SS and Sig
@@ -157,7 +157,7 @@ random <- function(ES, SE, cor_mat, iter, type) {
       new_SE[i] = sqrt(Sig[i, i])
     }
     
-    # recompute effects
+    # recompute effects (this recomputes mu and SE_mu for equation 52)
     TD_update = fixed(ES, new_SE, cor_mat)
     mu  = TD_update[1]
     SE_mu = TD_update[2]
@@ -168,6 +168,13 @@ random <- function(ES, SE, cor_mat, iter, type) {
     iter_store[t, 2] = SE_mu
     iter_store[t, 3] = tau
   }
+  # Implement the Knapp-Hartung adjustment (these are equations 54 and 55)
+  SigInv <- SOLVE(Sig)
+  c <- t_O%*%SigInv%*%O
+  Qstar <- t(ES)%*%SigInv%*%ES - (t_O%*%SigInv%*%ES)^2/c
+  SE_mu <- SE_mu*sqrt(Qstar/(K - 1))
+  
+  
   # output results
   ANS = matrix(nrow = 1, ncol = 6)
   colnames(ANS) = c("Mean ES", "SE", "Q", "df", "p", "tau")
