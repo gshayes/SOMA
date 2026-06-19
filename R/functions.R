@@ -95,7 +95,7 @@ somaf <- function(ES, SE, cor_mat) {
 somar <- function(ES, SE, cor_mat, iter, type) {
   
   # initial fixed-effect results from TDotFM
-  fix_results  = fixed(ES, SE, cor_mat)
+  fix_results  = somaf(ES, SE, cor_mat)
   mu  = fix_results[1]
   Q   = fix_results[3]
   df  = fix_results[4]
@@ -158,7 +158,7 @@ somar <- function(ES, SE, cor_mat, iter, type) {
     }
     
     # recompute effects (this recomputes mu and SE_mu for equation 52)
-    TD_update = fixed(ES, new_SE, cor_mat)
+    TD_update = somaf(ES, new_SE, cor_mat)
     mu  = TD_update[1]
     SE_mu = TD_update[2]
     
@@ -172,8 +172,8 @@ somar <- function(ES, SE, cor_mat, iter, type) {
   SigInv <- SOLVE(Sig)
   c <- t_O%*%SigInv%*%O
   Qstar <- t(ES)%*%SigInv%*%ES - (t_O%*%SigInv%*%ES)^2/c
+  if (Qstar < K - 1){Qstar <- 1}
   SE_mu <- SE_mu*sqrt(Qstar/(K - 1))
-  
   
   # output results
   ANS = matrix(nrow = 1, ncol = 6)
