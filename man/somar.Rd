@@ -20,7 +20,7 @@ somar(ES, SE, cor_mat, iter, type)
 \value{
 * `Mean ES` mean effect size estimate
 
-* `SE` standard error
+* `SE_KH` standard error with Knapp-Hartung adjustment
 
 * `Q` test statistic of test for heterogeneity
 
@@ -28,7 +28,11 @@ somar(ES, SE, cor_mat, iter, type)
 
 * `p` p-value of test for heterogeneity
 
-* `tau` measure of heterogeneity
+* `tau` measure of heterogeneity from ML or REML estimation
+
+* `tau_MM` measure of heterogeneity from MOM estimation
+
+* `SE_model` model based standard error
 }
 \description{
 Random Effects SO MA of overlapping studies
