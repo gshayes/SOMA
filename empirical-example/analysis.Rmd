@@ -1,0 +1,1380 @@
+---
+title: "Empirical Application: Second-Order Meta-Analysis With Overlapping Primary Studies"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    self_contained: true
+params:
+  project_root: "."
+  workbook_file: "workbook_original.xlsx"
+  output_dir: "outputs"
+  export_docx: false
+---
+
+```{r setup}
+# Preserve accented author names when R starts under a non-UTF-8 locale.
+if (!isTRUE(l10n_info()[["UTF-8"]])) {
+  locale_candidates <- if (.Platform$OS.type == "windows") {
+    c(".UTF-8", "English_United States.utf8")
+  } else {
+    c("C.UTF-8", "en_US.UTF-8")
+  }
+  for (candidate in locale_candidates) {
+    suppressWarnings(try(Sys.setlocale("LC_CTYPE", candidate), silent = TRUE))
+    if (isTRUE(l10n_info()[["UTF-8"]])) break
+  }
+  if (!isTRUE(l10n_info()[["UTF-8"]])) stop("A UTF-8 locale is needed to render study labels correctly.")
+}
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  comment = "#>"
+)
+
+required_packages <- c(
+  "dplyr", "tidyr", "purrr", "stringr", "readr", "readxl",
+  "tibble", "knitr", "rmarkdown", "metafor", "stringi"
+)
+missing_required <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_required) > 0) {
+  stop("Required packages are not installed: ", paste(missing_required, collapse = ", "))
+}
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(stringr)
+  library(readr)
+  library(readxl)
+  library(tibble)
+  library(knitr)
+  library(metafor)
+})
+
+round_numeric <- function(x, digits = 3) {
+  out <- x
+  num_cols <- vapply(out, is.numeric, logical(1))
+  out[num_cols] <- lapply(out[num_cols], round, digits = digits)
+  out
+}
+
+format_p <- function(p) {
+  dplyr::case_when(
+    is.na(p) ~ "",
+    p < .001 ~ "< .001",
+    TRUE ~ sprintf("%.3f", p)
+  )
+}
+
+fmt_num <- function(x, digits = 3) {
+  ifelse(is.na(x), "", sprintf(paste0("%.", digits, "f"), x))
+}
+
+kable_clean <- function(x, caption = NULL, digits = 3, escape = TRUE) {
+  knitr::kable(round_numeric(x, digits), caption = caption, row.names = FALSE, escape = escape)
+}
+
+check_near <- function(x, y, tolerance = 5e-4) {
+  all(abs(as.numeric(x) - as.numeric(y)) < tolerance, na.rm = FALSE)
+}
+
+check_rounded <- function(x, y, digits) {
+  all(round(as.numeric(x), digits) == as.numeric(y), na.rm = FALSE)
+}
+
+check_rounded_with_na <- function(x, y, digits) {
+  if (length(x) != length(y) || !identical(is.na(x), is.na(y))) return(FALSE)
+  keep <- !is.na(x)
+  all(round(as.numeric(x[keep]), digits) == as.numeric(y[keep]))
+}
+
+make_check <- function(name, passed, detail = "") {
+  tibble(check = name, passed = isTRUE(passed), detail = detail)
+}
+```
+
+# Purpose
+
+This R Markdown file reproduces the empirical application tables and the tables for Supplementary Appendices S2 and S3. Appendix/table numbering begins at S2 because Figure S1 is already used elsewhere in the supplement. The data and estimation functions are retained from the workflow underlying the submitted report. Reproduction instructions and preparation-test details are provided in `README.md`.
+
+Keep `analysis.Rmd` and `workbook_original.xlsx` in the same folder. Install the packages listed in `README.md`, open this file in RStudio, and click **Knit**. Alternatively, set the R working directory to this folder and run the command below. The report is written as `analysis.html`; additional CSV tables and session records are generated automatically in `outputs/`. No pre-existing output files, external scripts, or SOMA package installation are required. The estimation functions and 20 validation checks are embedded here. DOCX exports are optional and disabled by default.
+
+```r
+rmarkdown::render("analysis.Rmd")
+```
+
+# Paths and Data Sources
+
+```{r paths}
+project_root <- normalizePath(params$project_root, mustWork = TRUE)
+output_dir <- file.path(project_root, params$output_dir)
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+workbook_path <- file.path(project_root, params$workbook_file)
+if (!file.exists(workbook_path)) {
+  stop(
+    "Could not find ", workbook_path,
+    ". Keep workbook_original.xlsx in the same folder as analysis.Rmd."
+  )
+}
+
+paths_table <- tibble(
+  item = c("Project root", "Required workbook", "Generated outputs"),
+  expected_location = c(
+    "Folder used as project_root when rendering",
+    "workbook_original.xlsx (beside analysis.Rmd)",
+    "outputs/"
+  )
+)
+kable_clean(paths_table, "Expected reproducibility layout.", digits = 3)
+```
+
+```{r import-data}
+ma_order <- c("Chang2022", "Wang2024", "Faria2024", "Kalemkus2023")
+ma_labels <- c(
+  Chang2022 = "Chang et al. (2022)",
+  Wang2024 = "Wang et al. (2024)",
+  Faria2024 = "Faria & Miranda (2024)",
+  Kalemkus2023 = "Kalemkus & Kalemkus (2023)"
+)
+```
+
+# SOMAF/SOMAR Function Definitions
+
+This section embeds the final second-order meta-analysis functions used for the empirical application. somaf() reports the fixed-effect GLS estimate and model-based standard error. somar() keeps \(\Sigma_F\) fixed, forms \(\Sigma_R = \Sigma_F + \tau_B^2 I\), and returns both model-based and modified Knapp-Hartung validation fields.
+
+```{r soma-function-definitions}
+#========================================================================================================================
+# FINAL FUNCTIONS FOR THE EMPIRICAL APPLICATION
+#
+# This file is the final functions version used for the empirical application and
+# supplemental empirical-application outputs. It keeps the corrected SOMAR
+# covariance handling:
+#
+#   Sigma_R = Sigma_F + tau_B^2 I
+#
+# so the between-meta-analysis variance is added only to the diagonal and the
+# overlap-induced sampling covariances remain fixed. SOMAR also returns the
+# validation fields used by the reproducibility workflow: SE_model, SE_KH, Q_F,
+# p_Q_F, Q_star, p_Q_star, q_KH, and tau2.
+#========================================================================================================================
+
+#' Fixed Effects SO MA of overlapping studies
+#'
+#' @param ES Effect sizes from the meta analyses
+#' @param SE Standard errors corresponding to the effect sizes
+#' @param cor_mat Correlation matrix of the effect sizes
+#'
+#' @returns 
+#' * `Mean ES` mean effect size estimate
+#' 
+#' * `SE` standard error
+#' 
+#' * `Q` test statistic of test for heterogeneity
+#' 
+#' * `df` degrees of freedom of test for heterogeneity
+#' 
+#' * `p` p-value of test for heterogeneity
+#' @export
+somaf <- function(ES, SE, cor_mat) {
+  
+  # number of MAs
+  k = length(ES)
+  
+  # vector of 1s
+  O = matrix(nrow = k, ncol = 1, data = 1)
+  O_t = t(O)
+  
+  # initialize Sigma matrix
+  Sig = matrix(nrow = k, ncol = k)
+  
+  # fill in Sigma values with variances and covariances
+  for (i in 1:k) {
+    for (j in 1:k) {
+      if(i==j) { Sig[i,j] = SE[i]^2} else { 
+        Sig[i,j] = cor_mat[i,j] * SE[i] * SE[j] }
+    }
+  }
+  
+  # solve for inverse Sigma
+  Sig_inv = solve(Sig)
+  
+  # compute mean effect size (this is equation 44)
+  mu_hat = (O_t %*% Sig_inv %*% ES) / (O_t %*% Sig_inv %*% O)
+  
+  # compute variance of the estimator (this is equation 45)
+  V_mu_hat = 1 / (O_t %*% Sig_inv %*% O)
+  
+  # compute standard error of the estimator 
+  SE_mu_hat = sqrt(V_mu_hat)
+  
+  # Fixed-effect GLS heterogeneity statistic (Eq. 47).
+  Q = t(ES) %*% Sig_inv %*% ES - (O_t %*% Sig_inv %*% ES)^2 / (O_t %*% Sig_inv %*% O)
+  
+  # compute degrees of freedom for chi-square distribution
+  df = k-1
+  
+  # compute p-value for heterogeneity test
+  pvalue <- pchisq(q=Q, df=df, lower.tail=FALSE)
+  
+  # print out results
+  ANS <- matrix(nrow=1,ncol=5)
+  colnames(ANS) <- c("Mean ES", "SE","Q","df", "p" )
+  
+  ANS[1] <- mu_hat
+  ANS[2] <- SE_mu_hat
+  ANS[3] <- Q
+  ANS[4] <- df
+  ANS[5] <- pvalue
+  return(ANS)
+}
+
+#' Random Effects SO MA of overlapping studies
+#'
+#' @param ES Effect sizes from the meta analyses
+#' @param SE Standard errors corresponding to the effect sizes
+#' @param cor_mat Correlation matrix of the effect sizes
+#' @param iter Number of iterations
+#' @param type ML or REML
+#'
+#' @returns A one-row matrix with:
+#' * `Mean ES`: random-effects GLS estimate from the final Sigma_R.
+#' * `SE`: reported SOMAR standard error, equal to modified KH SE.
+#' * `Q`: backward-compatible alias for Q_F.
+#' * `df`: K - 1.
+#' * `p`: backward-compatible alias for p_Q_F.
+#' * `tau`: sqrt(tau2), the between-meta-analysis SD.
+#' * `SE_model`: model-based GLS SE from the final Sigma_R.
+#' * `SE_KH`: modified Knapp-Hartung SE.
+#' * `Q_F`: fixed-effect GLS heterogeneity statistic using Sigma_F.
+#' * `p_Q_F`: chi-square p-value for Q_F.
+#' * `Q_star`: residual statistic using the final Sigma_R.
+#' * `p_Q_star`: chi-square p-value for Q_star.
+#' * `q_KH`: max(1, Q_star / df).
+#' * `tau2`: between-meta-analysis variance component.
+#' @export
+somar <- function(ES, SE, cor_mat, iter = 50, type = c("REML", "ML")) {
+  type <- match.arg(type)
+  
+  # Store fixed-effect heterogeneity quantities separately.
+  fix_results  = somaf(ES, SE, cor_mat)
+  mu    = as.numeric(fix_results[1])
+  Q_F   = as.numeric(fix_results[3])
+  df    = as.numeric(fix_results[4])
+  p_Q_F = as.numeric(fix_results[5])
+  
+  # number of meta-analyses
+  k = length(ES)
+  
+  # vector of 1s
+  O = matrix(nrow = k, ncol = 1, data = 1)
+  O_t = t(O)
+  
+  # starting value for tau^2
+  tau2 = 0
+  
+  # create covariance matrix under fixed model
+  Sigma_F <- outer(SE, SE)*cor_mat
+  diag(Sigma_F) <- SE^2
+  
+  # Random-effects covariance matrix (Eq. 49): Sigma_R = Sigma_F + tau_B^2 I.
+  Sig <- Sigma_F
+  diag(Sig) <- diag(Sigma_F) + tau2
+  
+  # store iteration estimates
+  iter_store = matrix(nrow = iter, ncol = 3)
+  
+  # begin iteration
+  for (t in 1:iter) {
+    
+    Sig_inv = solve(Sig)
+    V_mu = 1 / (O_t %*% Sig_inv %*% O)
+    W = O_t %*% Sig_inv
+    
+    # REML correction term (Eq. 54).
+    REML_correction = 0
+    if (identical(type, "REML")) {
+      REML_correction = 1 / (W %*% O)
+    }
+    
+    # ML/REML iterative update for tau_B^2 (Eqs. 52-54).
+    tau2 = sum(W^2 * ((ES - mu)^2 - SE^2)) / sum(W^2) + REML_correction
+    tau2 <- max(0, as.numeric(tau2))
+    
+    # Rebuild Sigma_R after the tau2 update, then recompute its inverse.
+    # This applies Eq. 49 and recomputes mu and SE_model using Eqs. 50-51.
+    Sig <- Sigma_F
+    diag(Sig) <- diag(Sigma_F) + tau2
+
+    Sig_inv <- solve(Sig)
+
+    # Recompute mu and model-based SE from updated Sigma_R (Eqs. 50-51).
+    mu <- as.numeric(O_t %*% Sig_inv %*% ES / (O_t %*% Sig_inv %*% O))
+    SE_mu <- sqrt(as.numeric(1 / (O_t %*% Sig_inv %*% O)))
+    
+    # store progress
+    tau = ifelse(tau2 >= 0, sqrt(tau2), 0)
+    iter_store[t, 1] = mu
+    iter_store[t, 2] = SE_mu
+    iter_store[t, 3] = tau
+  }
+  # Knapp-Hartung adjustment (Eqs. 55-56).
+  # Final GLS fit using the final Sigma_R.
+  # Mean and model-based SE correspond to Eqs. 50-51.
+  # Q_star corresponds to Eq. 56.
+  SigInv <- solve(Sig)
+  denom <- as.numeric(O_t %*% SigInv %*% O)
+
+  mu <- as.numeric(O_t %*% SigInv %*% ES / denom)
+  SE_model <- sqrt(as.numeric(1 / denom))
+
+  Q_star <- as.numeric(
+    t(ES) %*% SigInv %*% ES -
+      (O_t %*% SigInv %*% ES)^2 / denom
+  )
+
+  p_Q_star <- pchisq(Q_star, df = df, lower.tail = FALSE)
+
+  # Modified Knapp-Hartung adjustment for SOMAR only.
+  # The multiplier is q_KH = max(1, Q_star / df), so the adjustment
+  # can increase but not decrease the random-effects model-based SE.
+  q_KH <- max(1, Q_star / df)
+  SE_KH <- SE_model * sqrt(q_KH)
+  tau_B <- sqrt(tau2)
+  
+  # output results
+  # Return model-based SE, KH SE, Q_F, Q_star, and tau2_B explicitly.
+  ANS <- matrix(nrow = 1, ncol = 14)
+  colnames(ANS) <- c(
+    "Mean ES",
+    "SE",
+    "Q",
+    "df",
+    "p",
+    "tau",
+    "SE_model",
+    "SE_KH",
+    "Q_F",
+    "p_Q_F",
+    "Q_star",
+    "p_Q_star",
+    "q_KH",
+    "tau2"
+  )
+  
+  ANS[1]  <- mu
+  ANS[2]  <- SE_KH        # backward-compatible reported SE; KH-adjusted
+  ANS[3]  <- Q_F          # backward-compatible Q; fixed-effect heterogeneity statistic
+  ANS[4]  <- df
+  ANS[5]  <- p_Q_F        # backward-compatible p; heterogeneity-test p-value
+  ANS[6]  <- tau_B
+  ANS[7]  <- SE_model
+  ANS[8]  <- SE_KH
+  ANS[9]  <- Q_F
+  ANS[10] <- p_Q_F
+  ANS[11] <- Q_star
+  ANS[12] <- p_Q_star
+  ANS[13] <- q_KH
+  ANS[14] <- tau2
+  return(ANS)
+}
+
+```
+# Analysis Functions
+
+This section defines small helper functions used to recompute the first-order summaries and format the second-order outputs.
+
+```{r helper-functions}
+first_order_fe <- function(es, variance) {
+  w <- 1 / variance
+  tibble(
+    fixed_mean = sum(w * es) / sum(w),
+    fixed_variance = 1 / sum(w),
+    fixed_se = sqrt(1 / sum(w)),
+    fixed_weight_sum = sum(w)
+  )
+}
+
+first_order_re <- function(es, variance) {
+  fit <- metafor::rma(yi = es, vi = variance, method = "REML")
+  tau2 <- as.numeric(fit$tau2)
+  w <- 1 / (variance + tau2)
+  tibble(
+    random_mean = as.numeric(fit$b[1, 1]),
+    random_mean_variance = as.numeric(fit$se^2),
+    random_se = as.numeric(fit$se),
+    Q_F = as.numeric(fit$QE),
+    df = as.numeric(fit$k - 1),
+    p_Q_F = as.numeric(fit$QEp),
+    tau2 = tau2,
+    tau = sqrt(tau2),
+    random_weight_sum = sum(w)
+  )
+}
+
+format_table_p <- function(x) {
+  ifelse(is.na(x), "", ifelse(x < .001, "< .001", sprintf("%.3f", x)))
+}
+
+as_somaf_row <- function(label, fit) {
+  # SOMAF rows use the model-based GLS SE only.
+  tibble(
+    analysis = label,
+    source = "SOMAF",
+    mean = as.numeric(fit[1, "Mean ES"]),
+    SE = as.numeric(fit[1, "SE"]),
+    Q = as.numeric(fit[1, "Q"]),
+    df = as.numeric(fit[1, "df"]),
+    p = as.numeric(fit[1, "p"]),
+    tau = NA_real_,
+    SE_model = as.numeric(fit[1, "SE"]),
+    SE_KH = NA_real_,
+    Q_F = as.numeric(fit[1, "Q"]),
+    p_Q_F = as.numeric(fit[1, "p"]),
+    Q_star = NA_real_,
+    p_Q_star = NA_real_,
+    q_KH = NA_real_,
+    tau2 = NA_real_
+  )
+}
+
+as_somar_row <- function(label, fit) {
+  # SOMAR rows use the modified Knapp-Hartung SE.
+  tibble(
+    analysis = label,
+    source = "SOMAR",
+    mean = as.numeric(fit[1, "Mean ES"]),
+    SE = as.numeric(fit[1, "SE"]),
+    Q = as.numeric(fit[1, "Q"]),
+    df = as.numeric(fit[1, "df"]),
+    p = as.numeric(fit[1, "p"]),
+    tau = as.numeric(fit[1, "tau"]),
+    SE_model = as.numeric(fit[1, "SE_model"]),
+    SE_KH = as.numeric(fit[1, "SE_KH"]),
+    Q_F = as.numeric(fit[1, "Q_F"]),
+    p_Q_F = as.numeric(fit[1, "p_Q_F"]),
+    Q_star = as.numeric(fit[1, "Q_star"]),
+    p_Q_star = as.numeric(fit[1, "p_Q_star"]),
+    q_KH = as.numeric(fit[1, "q_KH"]),
+    tau2 = as.numeric(fit[1, "tau2"])
+  )
+}
+```
+
+# Workbook Import and Harmonization
+
+This chunk reads the original Excel workbook and constructs the analysis objects used throughout the report. The CSV files written later are generated from these objects; they are not required inputs.
+
+```{r workbook-import}
+load_ar_primary_es <- function(
+  excel_path,
+  sheet = "Sheet1",
+  include_ma5 = FALSE,
+  drop_overall = TRUE
+) {
+  raw <- as.data.frame(readxl::read_excel(
+    excel_path,
+    sheet = sheet,
+    col_names = FALSE,
+    .name_repair = "minimal"
+  ))
+
+  expected_names <- c("study_id", paste0(rep(c("T", "S"), 5), rep(1:5, each = 2)))
+  if (ncol(raw) < length(expected_names)) {
+    stop("Workbook has fewer columns than expected. Check the workbook layout.")
+  }
+  raw <- raw[, seq_along(expected_names)]
+  names(raw) <- expected_names
+
+  dat <- raw[-c(1, 2, 3), ]
+  dat$study_id <- trimws(as.character(dat$study_id))
+  for (nm in setdiff(names(dat), "study_id")) {
+    dat[[nm]] <- suppressWarnings(as.numeric(dat[[nm]]))
+  }
+
+  if (drop_overall) {
+    dat <- dat[is.na(dat$study_id) | toupper(dat$study_id) != "OVERALL", ]
+  }
+
+  ma_lookup <- tibble(
+    ma_index = 1:5,
+    ma_id = c("Chang2022", "Wang2024", "Faria2024", "Kalemkus2023", "Cai2022"),
+    citation = c(
+      "Chang et al. (2022)",
+      "Wang et al. (2024)",
+      "Faria & Miranda (2024)",
+      "Kalemkus & Kalemkus (2023)",
+      "Cai et al. (2022)"
+    )
+  )
+
+  if (!include_ma5) {
+    ma_lookup <- ma_lookup %>% filter(ma_index <= 4)
+  }
+
+  long <- purrr::map_dfr(ma_lookup$ma_index, function(j) {
+    t_col <- paste0("T", j)
+    s_col <- paste0("S", j)
+    keep <- !is.na(dat[[t_col]]) & !is.na(dat[[s_col]])
+
+    tibble(
+      ma_index = j,
+      ma_id = ma_lookup$ma_id[ma_lookup$ma_index == j],
+      citation = ma_lookup$citation[ma_lookup$ma_index == j],
+      study_id = dat$study_id[keep],
+      row_in_excel = which(keep) + 3,
+      es = dat[[t_col]][keep],
+      se = dat[[s_col]][keep]
+    )
+  })
+
+  vectors <- list()
+  for (j in ma_lookup$ma_index) {
+    sub <- long[long$ma_index == j, ]
+    vectors[[paste0("T", j)]] <- sub$es
+    vectors[[paste0("S", j)]] <- sub$se
+  }
+
+  list(
+    wide = dat,
+    long = long,
+    vectors = vectors,
+    ma_lookup = ma_lookup
+  )
+}
+
+validate_ar_workbook <- function(imported) {
+  expected_counts <- c(T1 = 99, T2 = 33, T3 = 15, T4 = 16)
+  for (nm in names(expected_counts)) {
+    actual <- length(imported$vectors[[nm]])
+    if (actual != expected_counts[[nm]]) {
+      stop(sprintf("Imported %s has length %d, but expected %d.", nm, actual, expected_counts[[nm]]))
+    }
+  }
+  if (nrow(imported$long) != 163) {
+    stop("The four retained meta-analyses should contribute 163 coded effect-size rows.")
+  }
+  if (length(unique(imported$long$study_id)) != 136) {
+    stop("The workbook should contain 136 unique study labels before label reconciliation.")
+  }
+  if (any(is.na(imported$long$study_id) | !nzchar(imported$long$study_id))) {
+    stop("Imported data contain missing or blank study labels.")
+  }
+  if (any(is.na(imported$long$se) | imported$long$se <= 0)) {
+    stop("Imported data contain missing, zero, or negative standard errors.")
+  }
+  invisible(TRUE)
+}
+
+canonicalize_study_id <- function(x) {
+  x <- trimws(x)
+  x[x == "Giasiranis and Sofos (2017)"] <- "Giasiranis & Sofos (2017)"
+  x[x == "Giasiranis & Sofos (2017)"] <- "Giasiranis & Sofos (2017)"
+  x[x == "Chen and Tsai (2012"] <- "Chen and Tsai (2012)"
+  x
+}
+
+ar_primary <- load_ar_primary_es(workbook_path, include_ma5 = FALSE)
+validate_ar_workbook(ar_primary)
+
+long_imported <- ar_primary$long %>%
+  mutate(
+    study_id_workbook = study_id,
+    canonical_study_id = canonicalize_study_id(study_id_workbook),
+    variance = se^2
+  )
+
+# Explicit ICU collation keeps the published Common IDs stable across computers.
+# This ordering matches all 135 IDs in the submitted supplementary tables.
+ordered_study_ids <- stringi::stri_sort(unique(long_imported$canonical_study_id), locale = "en_US")
+study_crosswalk <- tibble(
+  common_id = seq_along(ordered_study_ids),
+  canonical_study_id = ordered_study_ids
+)
+
+first_order_long_csv <- long_imported %>%
+  left_join(study_crosswalk, by = "canonical_study_id") %>%
+  mutate(study_id = study_id_workbook) %>%
+  arrange(factor(ma_id, levels = ma_order), common_id)
+
+if (any(duplicated(first_order_long_csv[c("ma_id", "canonical_study_id")]))) {
+  stop("The reconciled crosswalk creates duplicate primary-study IDs within at least one first-order meta-analysis.")
+}
+
+crosswalk_decisions_csv <- tibble(
+  workbook_label = c(
+    "Giasiranis and Sofos (2017)",
+    "Giasiranis & Sofos (2017)",
+    "Chen and Tsai (2012",
+    "Erbas and Demirer (2019)",
+    "Erbas et al. (2019)"
+  ),
+  reconciled_primary_study_id = c(
+    "Giasiranis & Sofos (2017)",
+    "Giasiranis & Sofos (2017)",
+    "Chen and Tsai (2012)",
+    "Erbas and Demirer (2019)",
+    "Erbas et al. (2019)"
+  ),
+  decision_note = c(
+    "Merged with ampersand variant; same primary study label.",
+    "Merged with spelled-out 'and' variant; same primary study label.",
+    "Corrected missing closing parenthesis; this does not create overlap.",
+    "Retained as a separate workbook-coded primary study from Erbas et al. (2019).",
+    "Retained as a separate workbook-coded primary study from Erbas and Demirer (2019)."
+  )
+)
+
+first_order_long_csv <- first_order_long_csv %>%
+  group_by(ma_id) %>%
+  group_modify(~ {
+    re <- first_order_re(.x$es, .x$variance)
+    .x %>%
+      mutate(
+        fixed_weight = 1 / variance,
+        random_weight = 1 / (variance + re$tau2)
+      )
+  }) %>%
+  ungroup() %>%
+  arrange(factor(ma_id, levels = ma_order), common_id)
+
+comprehensive_data_csv <- first_order_long_csv %>%
+  group_by(common_id, canonical_study_id) %>%
+  summarize(
+    workbook_labels = paste(unique(study_id_workbook), collapse = "; "),
+    n_coded_rows = n(),
+    es = stats::median(es),
+    se = stats::median(se),
+    .groups = "drop"
+  ) %>%
+  mutate(variance = se^2) %>%
+  arrange(common_id)
+
+comp_fe_imported <- first_order_fe(comprehensive_data_csv$es, comprehensive_data_csv$variance)
+comp_re_imported <- first_order_re(comprehensive_data_csv$es, comprehensive_data_csv$variance)
+comp_q_imported <- sum((1 / comprehensive_data_csv$variance) *
+                         (comprehensive_data_csv$es - comp_fe_imported$fixed_mean)^2)
+comp_df_imported <- nrow(comprehensive_data_csv) - 1
+comp_p_imported <- pchisq(comp_q_imported, df = comp_df_imported, lower.tail = FALSE)
+
+comprehensive_results_csv <- tibble(
+  analysis = c("Comprehensive fixed-effect benchmark", "Comprehensive random-effects benchmark"),
+  k = nrow(comprehensive_data_csv),
+  mean = c(comp_fe_imported$fixed_mean, comp_re_imported$random_mean),
+  SE_model = c(comp_fe_imported$fixed_se, comp_re_imported$random_se),
+  variance_model = c(comp_fe_imported$fixed_variance, comp_re_imported$random_mean_variance),
+  Q = c(comp_q_imported, comp_q_imported),
+  df = c(comp_df_imported, comp_df_imported),
+  p_Q = c(comp_p_imported, comp_p_imported),
+  tau2 = c(NA_real_, comp_re_imported$tau2),
+  tau = c(NA_real_, comp_re_imported$tau)
+)
+```
+
+# Data Reconciliation
+
+The empirical application uses four first-order meta-analyses. The row-level data use a common numeric ID, `common_id`, so that the same primary-study/effect-size entry can be identified across meta-analyses.
+
+```{r count-reconciliation}
+id_membership <- first_order_long_csv %>%
+  distinct(common_id, canonical_study_id, ma_id) %>%
+  count(common_id, canonical_study_id, name = "n_meta_analyses")
+
+computed_counts <- tibble(
+  quantity = c(
+    "Raw coded rows across the four first-order meta-analyses",
+    "Unique workbook labels before reconciliation",
+    "Reconciled common primary-study IDs",
+    "Duplicate rows due to overlap after reconciliation",
+    "Comprehensive benchmark rows under one-row-per-primary-study rule",
+    "Primary-study IDs appearing in only one meta-analysis",
+    "Primary-study IDs appearing in more than one meta-analysis",
+    "Rows contributed by overlapping IDs"
+  ),
+  count = c(
+    nrow(first_order_long_csv),
+    136L,
+    n_distinct(first_order_long_csv$common_id),
+    nrow(first_order_long_csv) - n_distinct(first_order_long_csv$common_id),
+    nrow(comprehensive_data_csv),
+    sum(id_membership$n_meta_analyses == 1),
+    sum(id_membership$n_meta_analyses > 1),
+    first_order_long_csv %>%
+      semi_join(id_membership %>% filter(n_meta_analyses > 1), by = c("common_id", "canonical_study_id")) %>%
+      nrow()
+  )
+)
+
+kable_clean(computed_counts, "Count reconciliation for the empirical application.")
+```
+
+The manual label reconciliation decisions were:
+
+```{r crosswalk-decisions}
+crosswalk_display <- crosswalk_decisions_csv %>%
+  transmute(
+    `Workbook label` = workbook_label,
+    `Reconciled primary-study ID` = reconciled_primary_study_id,
+    `Decision note` = decision_note
+  )
+
+kable_clean(crosswalk_display, "Manual crosswalk decisions.")
+```
+
+# First-Order Meta-Analysis Summaries: Table 3
+
+Table 3 summarizes the four first-order meta-analyses. The column `Unique to one MA` counts rows whose common ID appears in only one of the four first-order meta-analyses.
+
+```{r table3}
+unique_to_one_by_ma <- first_order_long_csv %>%
+  left_join(id_membership %>% select(common_id, n_meta_analyses), by = "common_id") %>%
+  group_by(ma_id) %>%
+  summarize(`Unique to one MA` = sum(n_meta_analyses == 1), .groups = "drop")
+
+first_order_recomputed <- first_order_long_csv %>%
+  group_by(ma_id) %>%
+  group_modify(~ bind_cols(
+    tibble(k = nrow(.x)),
+    first_order_fe(.x$es, .x$variance),
+    first_order_re(.x$es, .x$variance)
+  )) %>%
+  ungroup() %>%
+  left_join(unique_to_one_by_ma, by = "ma_id") %>%
+  mutate(
+    meta_analysis = unname(ma_labels[ma_id]),
+    ma_id = factor(ma_id, levels = ma_order)
+  ) %>%
+  arrange(ma_id) %>%
+  select(ma_id, meta_analysis, k, `Unique to one MA`, fixed_weight_sum, random_weight_sum,
+         fixed_mean, fixed_variance, fixed_se, random_mean, random_mean_variance,
+         random_se, Q_F, df, p_Q_F, tau2, tau)
+
+table3_display <- first_order_recomputed %>%
+  transmute(
+    `Meta-analysis` = meta_analysis,
+    `Total ES` = k,
+    `Unique to one MA`,
+    `FE Mean` = fixed_mean,
+    `FE SE` = fixed_se,
+    `RE Mean` = random_mean,
+    `RE SE` = random_se,
+    Q = Q_F,
+    df,
+    tau
+  )
+
+kable_clean(table3_display, "Table 3. First-order meta-analysis summaries.", digits = 3)
+```
+
+# Pairwise Overlap Correlations: Table 4
+
+This section computes pairwise overlap correlations using shared Common IDs and fixed- and random-effects weights.
+
+The boldface values above the diagonal are the correlations between the random effects weighted averages, that is using the random effects weights and (41). The values in regular type below the diagonal are the correlations among the fixed effects weighted averages, that is using (39).
+
+The pairwise calculations underlying the overlap-correlation matrix are shown in Supplementary Appendix S3. For each pair of first-order meta-analyses, the appendix lists the overlapping Common IDs, the effect sizes and variances as coded in each meta-analysis, the corresponding fixed- and random-effects weights, the shared-weight sums, and the resulting overlap correlations.
+
+```{r pairwise-overlap}
+pair_order <- list(
+  c("Chang2022", "Wang2024"),
+  c("Chang2022", "Faria2024"),
+  c("Chang2022", "Kalemkus2023"),
+  c("Wang2024", "Faria2024"),
+  c("Wang2024", "Kalemkus2023"),
+  c("Faria2024", "Kalemkus2023")
+)
+
+pairwise_recomputed <- purrr::map_dfr(pair_order, function(pair) {
+  i <- pair[1]
+  j <- pair[2]
+  left <- first_order_long_csv %>% filter(ma_id == i)
+  right <- first_order_long_csv %>% filter(ma_id == j)
+  shared <- inner_join(left, right, by = "common_id", suffix = c("_i", "_j")) %>%
+    mutate(
+      shared_fixed_weight = sqrt(fixed_weight_i * fixed_weight_j),
+      shared_random_weight = sqrt(random_weight_i * random_weight_j)
+    )
+  tibble(
+    pair = paste(ma_labels[i], "and", ma_labels[j]),
+    ma_i = i,
+    ma_j = j,
+    shared_studies = nrow(shared),
+    fixed_shared_weight = sum(shared$shared_fixed_weight),
+    fixed_total_weight_i = sum(left$fixed_weight),
+    fixed_total_weight_j = sum(right$fixed_weight),
+    fixed_overlap_correlation = fixed_shared_weight / sqrt(fixed_total_weight_i * fixed_total_weight_j),
+    random_shared_weight = sum(shared$shared_random_weight),
+    random_total_weight_i = sum(left$random_weight),
+    random_total_weight_j = sum(right$random_weight),
+    random_overlap_correlation = random_shared_weight / sqrt(random_total_weight_i * random_total_weight_j)
+  )
+})
+
+PP_FE <- diag(length(ma_order))
+PP_RE <- diag(length(ma_order))
+dimnames(PP_FE) <- dimnames(PP_RE) <- list(unname(ma_labels[ma_order]), unname(ma_labels[ma_order]))
+for (row in seq_len(nrow(pairwise_recomputed))) {
+  i <- match(pairwise_recomputed$ma_i[row], ma_order)
+  j <- match(pairwise_recomputed$ma_j[row], ma_order)
+  PP_FE[i, j] <- PP_FE[j, i] <- pairwise_recomputed$fixed_overlap_correlation[row]
+  PP_RE[i, j] <- PP_RE[j, i] <- pairwise_recomputed$random_overlap_correlation[row]
+}
+
+table4_matrix <- PP_FE
+table4_matrix[upper.tri(table4_matrix)] <- PP_RE[upper.tri(PP_RE)]
+
+table4_display <- as.data.frame(round(table4_matrix, 3)) %>%
+  tibble::rownames_to_column("Meta-analysis")
+names(table4_display) <- c("Meta-analysis", unname(ma_labels[ma_order]))
+
+table4_markdown <- table4_display
+for (i in seq_along(ma_order)) {
+  for (j in seq_along(ma_order)) {
+    value <- sprintf("%.3f", table4_matrix[i, j])
+    table4_markdown[i, j + 1] <- if (j > i) paste0("**", value, "**") else value
+  }
+}
+
+kable_clean(table4_markdown, "Table 4. Lower triangle = fixed-effect correlations; upper triangle = random-effects correlations.", escape = FALSE)
+```
+
+```{r appendix-s3-pairwise-overview}
+appendix_s3_overview <- pairwise_recomputed %>%
+  transmute(
+    Pair = pair,
+    `Shared IDs` = shared_studies,
+    `Shared FE weight` = fixed_shared_weight,
+    `Total FE weight i` = fixed_total_weight_i,
+    `Total FE weight j` = fixed_total_weight_j,
+    rho_FE = fixed_overlap_correlation,
+    `Shared RE weight` = random_shared_weight,
+    `Total RE weight i` = random_total_weight_i,
+    `Total RE weight j` = random_total_weight_j,
+    rho_RE = random_overlap_correlation
+  )
+
+kable_clean(appendix_s3_overview, "Supplementary Appendix S3 overview: pairwise shared weights and overlap correlations.", digits = 3)
+```
+
+# Comprehensive Benchmark Analyses
+
+The comprehensive benchmark uses one row per reconciled primary-study ID. This is the 135-row benchmark generated from the Excel/study-ID crosswalk.
+
+```{r comprehensive-benchmark}
+comp_fe <- first_order_fe(comprehensive_data_csv$es, comprehensive_data_csv$variance)
+comp_re_fit <- metafor::rma(yi = comprehensive_data_csv$es, vi = comprehensive_data_csv$variance, method = "REML")
+comp_re <- tibble(
+  random_mean = as.numeric(comp_re_fit$b[1, 1]),
+  random_se = as.numeric(comp_re_fit$se),
+  random_variance = as.numeric(comp_re_fit$se^2),
+  Q = as.numeric(comp_re_fit$QE),
+  df = as.numeric(comp_re_fit$k - 1),
+  p_Q = as.numeric(comp_re_fit$QEp),
+  tau2 = as.numeric(comp_re_fit$tau2),
+  tau = sqrt(as.numeric(comp_re_fit$tau2))
+)
+
+comprehensive_recomputed <- tibble(
+  Analysis = c("Comprehensive fixed-effect benchmark", "Comprehensive random-effects benchmark"),
+  k = nrow(comprehensive_data_csv),
+  Mean = c(comp_fe$fixed_mean, comp_re$random_mean),
+  SE = c(comp_fe$fixed_se, comp_re$random_se),
+  Q = c(comp_re$Q, comp_re$Q),
+  df = c(comp_re$df, comp_re$df),
+  tau = c(NA_real_, comp_re$tau)
+)
+
+kable_clean(comprehensive_recomputed, "Comprehensive benchmark analyses.", digits = 3)
+```
+
+# Second-Order Meta-Analysis Inputs
+
+The second-order analyses use four first-order meta-analytic estimates as inputs. Fixed-effect first-order inputs are used for SOFF and SOFR; random-effects first-order inputs are used for SORF and SORR.
+
+```{r soma-inputs}
+TP_FE <- setNames(first_order_recomputed$fixed_mean, first_order_recomputed$meta_analysis)
+SP_FE <- setNames(first_order_recomputed$fixed_se, first_order_recomputed$meta_analysis)
+TP_RE <- setNames(first_order_recomputed$random_mean, first_order_recomputed$meta_analysis)
+SP_RE <- setNames(first_order_recomputed$random_se, first_order_recomputed$meta_analysis)
+
+soma_input_fe <- tibble(meta_analysis = names(TP_FE), estimate = as.numeric(TP_FE), se = as.numeric(SP_FE), variance = se^2)
+soma_input_re <- tibble(meta_analysis = names(TP_RE), estimate = as.numeric(TP_RE), se = as.numeric(SP_RE), variance = se^2)
+
+kable_clean(soma_input_fe, "Fixed-effect first-order inputs.", digits = 4)
+kable_clean(soma_input_re, "Random-effects first-order inputs.", digits = 4)
+```
+
+# Second-Order Meta-Analysis Results
+
+For fixed-effect second-order rows, SOFF and SORF, the reported SE is the model-based GLS standard error. Knapp-Hartung quantities are not reported.
+
+For random-effects second-order rows, SOFR and SORR, the reported SE is the modified Knapp-Hartung SE:
+
+\[
+q_{KH} = \max(1, Q^*/df),
+\qquad
+SE_{KH} = SE_{model}\sqrt{q_{KH}}.
+\]
+
+```{r soma-results}
+identity_cor <- diag(length(ma_order))
+dimnames(identity_cor) <- dimnames(PP_FE)
+
+soma_recomputed <- bind_rows(
+  as_somaf_row("FE-input / SOMAF adjusted", somaf(TP_FE, SP_FE, PP_FE)),
+  as_somar_row("FE-input / SOMAR adjusted", somar(TP_FE, SP_FE, PP_FE, iter = 50, type = "REML")),
+  as_somaf_row("RE-input / SOMAF adjusted", somaf(TP_RE, SP_RE, PP_RE)),
+  as_somar_row("RE-input / SOMAR adjusted", somar(TP_RE, SP_RE, PP_RE, iter = 50, type = "REML")),
+  as_somaf_row("FE-input / SOMAF naive", somaf(TP_FE, SP_FE, identity_cor)),
+  as_somar_row("FE-input / SOMAR naive", somar(TP_FE, SP_FE, identity_cor, iter = 50, type = "REML")),
+  as_somaf_row("RE-input / SOMAF naive", somaf(TP_RE, SP_RE, identity_cor)),
+  as_somar_row("RE-input / SOMAR naive", somar(TP_RE, SP_RE, identity_cor, iter = 50, type = "REML"))
+)
+
+kable_clean(soma_recomputed, "Adjusted and naive SOMAF/SOMAR results.", digits = 4)
+```
+
+# Constant-Correlation Sensitivity Analyses
+
+The rows with \(\rho = 0.25\) are constant-correlation sensitivity analyses. They are not maximum-correlation analyses.
+
+```{r constant-rho}
+rho25 <- matrix(0.25, length(ma_order), length(ma_order))
+diag(rho25) <- 1
+dimnames(rho25) <- dimnames(PP_FE)
+
+rho25_results <- bind_rows(
+  as_somaf_row("SOFF(rho = 0.25)", somaf(TP_FE, SP_FE, rho25)),
+  as_somar_row("SOFR(rho = 0.25)", somar(TP_FE, SP_FE, rho25, iter = 50, type = "REML")),
+  as_somaf_row("SORF(rho = 0.25)", somaf(TP_RE, SP_RE, rho25)),
+  as_somar_row("SORR(rho = 0.25)", somar(TP_RE, SP_RE, rho25, iter = 50, type = "REML"))
+)
+
+rho25_display <- rho25_results %>%
+  transmute(
+    Row = analysis,
+    Mean = mean,
+    SE,
+    QB = Q,
+    df,
+    tauB = tau
+  )
+
+kable_clean(rho25_display, "Constant-correlation sensitivity analyses.", digits = 3)
+```
+
+# Table 5
+
+```{r table5}
+row_lookup <- function(data, label) data %>% filter(analysis == label) %>% slice(1)
+
+table5_numeric <- bind_rows(
+  tibble(
+    row = "CF",
+    `Mean ES` = comprehensive_results_csv$mean[comprehensive_results_csv$analysis == "Comprehensive fixed-effect benchmark"],
+    SE = comprehensive_results_csv$SE_model[comprehensive_results_csv$analysis == "Comprehensive fixed-effect benchmark"],
+    QT = comprehensive_results_csv$Q[comprehensive_results_csv$analysis == "Comprehensive fixed-effect benchmark"],
+    dfT = comprehensive_results_csv$df[comprehensive_results_csv$analysis == "Comprehensive fixed-effect benchmark"],
+    tauT = NA_real_, QB = NA_real_, df = NA_real_, tauB = NA_real_
+  ),
+  tibble(
+    row = "CR",
+    `Mean ES` = comprehensive_results_csv$mean[comprehensive_results_csv$analysis == "Comprehensive random-effects benchmark"],
+    SE = comprehensive_results_csv$SE_model[comprehensive_results_csv$analysis == "Comprehensive random-effects benchmark"],
+    QT = comprehensive_results_csv$Q[comprehensive_results_csv$analysis == "Comprehensive random-effects benchmark"],
+    dfT = comprehensive_results_csv$df[comprehensive_results_csv$analysis == "Comprehensive random-effects benchmark"],
+    tauT = comprehensive_results_csv$tau[comprehensive_results_csv$analysis == "Comprehensive random-effects benchmark"],
+    QB = NA_real_, df = NA_real_, tauB = NA_real_
+  ),
+  tibble(row = "SOFF", `Mean ES` = row_lookup(soma_recomputed, "FE-input / SOMAF adjusted")$mean, SE = row_lookup(soma_recomputed, "FE-input / SOMAF adjusted")$SE, QT = NA_real_, dfT = NA_real_, tauT = NA_real_, QB = row_lookup(soma_recomputed, "FE-input / SOMAF adjusted")$Q, df = row_lookup(soma_recomputed, "FE-input / SOMAF adjusted")$df, tauB = NA_real_),
+  tibble(row = "SOFR", `Mean ES` = row_lookup(soma_recomputed, "FE-input / SOMAR adjusted")$mean, SE = row_lookup(soma_recomputed, "FE-input / SOMAR adjusted")$SE, QT = NA_real_, dfT = NA_real_, tauT = NA_real_, QB = row_lookup(soma_recomputed, "FE-input / SOMAR adjusted")$Q, df = row_lookup(soma_recomputed, "FE-input / SOMAR adjusted")$df, tauB = row_lookup(soma_recomputed, "FE-input / SOMAR adjusted")$tau),
+  tibble(row = "SOFF(rho = 0.25)", `Mean ES` = row_lookup(rho25_results, "SOFF(rho = 0.25)")$mean, SE = row_lookup(rho25_results, "SOFF(rho = 0.25)")$SE, QT = NA_real_, dfT = NA_real_, tauT = NA_real_, QB = row_lookup(rho25_results, "SOFF(rho = 0.25)")$Q, df = row_lookup(rho25_results, "SOFF(rho = 0.25)")$df, tauB = NA_real_),
+  tibble(row = "SOFR(rho = 0.25)", `Mean ES` = row_lookup(rho25_results, "SOFR(rho = 0.25)")$mean, SE = row_lookup(rho25_results, "SOFR(rho = 0.25)")$SE, QT = NA_real_, dfT = NA_real_, tauT = NA_real_, QB = row_lookup(rho25_results, "SOFR(rho = 0.25)")$Q, df = row_lookup(rho25_results, "SOFR(rho = 0.25)")$df, tauB = row_lookup(rho25_results, "SOFR(rho = 0.25)")$tau),
+  tibble(row = "Naive SOFF", `Mean ES` = row_lookup(soma_recomputed, "FE-input / SOMAF naive")$mean, SE = row_lookup(soma_recomputed, "FE-input / SOMAF naive")$SE, QT = NA_real_, dfT = NA_real_, tauT = NA_real_, QB = row_lookup(soma_recomputed, "FE-input / SOMAF naive")$Q, df = row_lookup(soma_recomputed, "FE-input / SOMAF naive")$df, tauB = NA_real_),
+  tibble(row = "Naive SOFR", `Mean ES` = row_lookup(soma_recomputed, "FE-input / SOMAR naive")$mean, SE = row_lookup(soma_recomputed, "FE-input / SOMAR naive")$SE, QT = NA_real_, dfT = NA_real_, tauT = NA_real_, QB = row_lookup(soma_recomputed, "FE-input / SOMAR naive")$Q, df = row_lookup(soma_recomputed, "FE-input / SOMAR naive")$df, tauB = row_lookup(soma_recomputed, "FE-input / SOMAR naive")$tau),
+  tibble(row = "SORF", `Mean ES` = row_lookup(soma_recomputed, "RE-input / SOMAF adjusted")$mean, SE = row_lookup(soma_recomputed, "RE-input / SOMAF adjusted")$SE, QT = NA_real_, dfT = NA_real_, tauT = NA_real_, QB = row_lookup(soma_recomputed, "RE-input / SOMAF adjusted")$Q, df = row_lookup(soma_recomputed, "RE-input / SOMAF adjusted")$df, tauB = NA_real_),
+  tibble(row = "SORR", `Mean ES` = row_lookup(soma_recomputed, "RE-input / SOMAR adjusted")$mean, SE = row_lookup(soma_recomputed, "RE-input / SOMAR adjusted")$SE, QT = NA_real_, dfT = NA_real_, tauT = NA_real_, QB = row_lookup(soma_recomputed, "RE-input / SOMAR adjusted")$Q, df = row_lookup(soma_recomputed, "RE-input / SOMAR adjusted")$df, tauB = row_lookup(soma_recomputed, "RE-input / SOMAR adjusted")$tau),
+  tibble(row = "SORF(rho = 0.25)", `Mean ES` = row_lookup(rho25_results, "SORF(rho = 0.25)")$mean, SE = row_lookup(rho25_results, "SORF(rho = 0.25)")$SE, QT = NA_real_, dfT = NA_real_, tauT = NA_real_, QB = row_lookup(rho25_results, "SORF(rho = 0.25)")$Q, df = row_lookup(rho25_results, "SORF(rho = 0.25)")$df, tauB = NA_real_),
+  tibble(row = "SORR(rho = 0.25)", `Mean ES` = row_lookup(rho25_results, "SORR(rho = 0.25)")$mean, SE = row_lookup(rho25_results, "SORR(rho = 0.25)")$SE, QT = NA_real_, dfT = NA_real_, tauT = NA_real_, QB = row_lookup(rho25_results, "SORR(rho = 0.25)")$Q, df = row_lookup(rho25_results, "SORR(rho = 0.25)")$df, tauB = row_lookup(rho25_results, "SORR(rho = 0.25)")$tau),
+  tibble(row = "Naive SORF", `Mean ES` = row_lookup(soma_recomputed, "RE-input / SOMAF naive")$mean, SE = row_lookup(soma_recomputed, "RE-input / SOMAF naive")$SE, QT = NA_real_, dfT = NA_real_, tauT = NA_real_, QB = row_lookup(soma_recomputed, "RE-input / SOMAF naive")$Q, df = row_lookup(soma_recomputed, "RE-input / SOMAF naive")$df, tauB = NA_real_),
+  tibble(row = "Naive SORR", `Mean ES` = row_lookup(soma_recomputed, "RE-input / SOMAR naive")$mean, SE = row_lookup(soma_recomputed, "RE-input / SOMAR naive")$SE, QT = NA_real_, dfT = NA_real_, tauT = NA_real_, QB = row_lookup(soma_recomputed, "RE-input / SOMAR naive")$Q, df = row_lookup(soma_recomputed, "RE-input / SOMAR naive")$df, tauB = row_lookup(soma_recomputed, "RE-input / SOMAR naive")$tau)
+)
+
+table5_display <- table5_numeric %>%
+  mutate(
+    `Mean ES` = fmt_num(`Mean ES`, 3),
+    SE = fmt_num(SE, 3),
+    QT = fmt_num(QT, 2),
+    dfT = ifelse(is.na(dfT), "", as.character(as.integer(dfT))),
+    tauT = fmt_num(tauT, 3),
+    QB = fmt_num(QB, 2),
+    df = ifelse(is.na(df), "", as.character(as.integer(df))),
+    tauB = fmt_num(tauB, 3)
+  )
+
+kable_clean(table5_display, "Table 5. Comprehensive, second-order, sensitivity, and naive analyses.", escape = FALSE)
+```
+
+# Supplementary Appendix S2: First-Order Effect-Size, Variance, and Weight Tables
+
+These tables list the coded effect sizes used in each of the four first-order meta-analyses in the empirical application. The column Common ID is shared across tables: the same number denotes the same reconciled primary-study/effect-size entry when it appears in more than one first-order meta-analysis. Fixed-effect weights are inverse-variance weights, and random-effects weights are inverse-variance weights after adding the first-order tau-squared estimate for the corresponding meta-analysis.
+
+```{r appendix-s2-first-order, results='asis'}
+appendix_s2_overlap_rows <- first_order_long_csv %>%
+  semi_join(id_membership %>% filter(n_meta_analyses > 1), by = c("common_id", "canonical_study_id")) %>%
+  nrow()
+
+appendix_s2_reconciliation <- tibble(
+  Quantity = c("Raw coded rows", "Reconciled common IDs", "Unique-to-one IDs", "Overlapping IDs", "Rows from overlapping IDs"),
+  Value = c(
+    nrow(first_order_long_csv),
+    n_distinct(first_order_long_csv$common_id),
+    sum(id_membership$n_meta_analyses == 1),
+    sum(id_membership$n_meta_analyses > 1),
+    appendix_s2_overlap_rows
+  ),
+  Meaning = c(
+    "Rows as coded across the four first-order meta-analyses.",
+    "Unique harmonized primary-study/effect-size IDs after label reconciliation.",
+    "IDs that occur in only one first-order meta-analysis.",
+    "IDs that occur in more than one first-order meta-analysis.",
+    "Coded rows contributed by those 22 overlapping IDs."
+  )
+)
+
+cat(knitr::kable(appendix_s2_reconciliation, caption = "Supplementary Appendix S2 reconciliation summary."), sep = "\n")
+
+make_s2_table <- function(ma) {
+  first_order_long_csv %>%
+    filter(ma_id == ma) %>%
+    arrange(common_id) %>%
+    transmute(
+      `Common ID` = common_id,
+      `Study/effect-size label` = canonical_study_id,
+      ES = es,
+      SE = se,
+      Variance = variance,
+      `Fixed weight` = fixed_weight,
+      `Random weight` = random_weight
+    )
+}
+
+make_s2_summary <- function(ma) {
+  first_order_recomputed %>%
+    filter(as.character(ma_id) == ma) %>%
+    transmute(
+      `FE weight sum` = fixed_weight_sum,
+      `RE weight sum` = random_weight_sum,
+      `FE mean` = fixed_mean,
+      `FE variance` = fixed_variance,
+      `FE SE` = fixed_se,
+      `RE mean` = random_mean,
+      `RE variance` = random_mean_variance,
+      `RE SE` = random_se,
+      Q = Q_F,
+      `tau^2` = tau2,
+      tau = tau,
+      df = df,
+      `p for Q` = format_p(p_Q_F)
+    )
+}
+
+for (i in seq_along(ma_order)) {
+  ma <- ma_order[i]
+  cat("\n\n## Table S2.", i, ". ", ma_labels[ma], "\n\n", sep = "")
+  cat(knitr::kable(round_numeric(make_s2_table(ma), 4), row.names = FALSE), sep = "\n")
+  cat("\n\nSummary line:\n\n")
+  cat(knitr::kable(round_numeric(make_s2_summary(ma), 4), row.names = FALSE), sep = "\n")
+}
+```
+
+# Supplementary Appendix S3: Pairwise Overlap Correlations Among First-Order Meta-Analyses
+
+This appendix shows how the pairwise correlations among first-order meta-analytic estimates were obtained. Each section corresponds to one pair of meta-analyses. The row-level table lists only overlapping primary-study/effect-size entries, using the same Common ID as Supplementary Appendix S2. For each overlapping entry, the table gives the effect size, variance, fixed-effect weight, and random-effects weight as coded in each meta-analysis. The final columns give the shared-weight contribution used for the fixed-effect and random-effects overlap correlations.
+
+```{r appendix-s3-pairwise, results='asis'}
+cat(knitr::kable(round_numeric(appendix_s3_overview, 3), caption = "Supplementary Appendix S3 overview."), sep = "\n")
+
+pairwise_details_recomputed <- purrr::map_dfr(pair_order, function(pair) {
+  i <- pair[1]
+  j <- pair[2]
+  left <- first_order_long_csv %>% filter(ma_id == i)
+  right <- first_order_long_csv %>% filter(ma_id == j)
+  inner_join(left, right, by = "common_id", suffix = c("_i", "_j")) %>%
+    mutate(
+      pair_id = paste(i, j, sep = "_"),
+      pair_label = paste(ma_labels[i], "and", ma_labels[j]),
+      shared_fixed_weight = sqrt(fixed_weight_i * fixed_weight_j),
+      shared_random_weight = sqrt(random_weight_i * random_weight_j)
+    ) %>%
+    select(pair_id, pair_label, common_id, canonical_study_id_i,
+           es_i, variance_i, fixed_weight_i, random_weight_i,
+           es_j, variance_j, fixed_weight_j, random_weight_j,
+           shared_fixed_weight, shared_random_weight)
+})
+
+make_s3_pair_table <- function(pair_id_value) {
+  pairwise_details_recomputed %>%
+    filter(pair_id == pair_id_value) %>%
+    arrange(common_id) %>%
+    transmute(
+      `Common ID` = common_id,
+      `Shared study/effect-size label` = canonical_study_id_i,
+      `ES in meta-analysis i` = es_i,
+      `Variance in meta-analysis i` = variance_i,
+      `Fixed-effect weight in meta-analysis i` = fixed_weight_i,
+      `Random-effects weight in meta-analysis i` = random_weight_i,
+      `ES in meta-analysis j` = es_j,
+      `Variance in meta-analysis j` = variance_j,
+      `Fixed-effect weight in meta-analysis j` = fixed_weight_j,
+      `Random-effects weight in meta-analysis j` = random_weight_j,
+      `Shared fixed-effect weight contribution` = shared_fixed_weight,
+      `Shared random-effects weight contribution` = shared_random_weight
+    )
+}
+
+make_s3_pair_summary <- function(pair_id_value) {
+  pair_summary <- pairwise_recomputed %>% mutate(pair_id = paste(ma_i, ma_j, sep = "_")) %>% filter(pair_id == pair_id_value)
+  tibble(
+    Quantity = c(
+      "Shared fixed-effect weight sum", "Total fixed-effect weight i", "Total fixed-effect weight j",
+      "Fixed-effect formula", "Fixed-effect correlation",
+      "Shared random-effects weight sum", "Total random-effects weight i", "Total random-effects weight j",
+      "Random-effects formula", "Random-effects correlation"
+    ),
+    Value = c(
+      sprintf("%.3f", pair_summary$fixed_shared_weight),
+      sprintf("%.3f", pair_summary$fixed_total_weight_i),
+      sprintf("%.3f", pair_summary$fixed_total_weight_j),
+      sprintf("%.3f / sqrt(%.3f x %.3f)", pair_summary$fixed_shared_weight, pair_summary$fixed_total_weight_i, pair_summary$fixed_total_weight_j),
+      sprintf("%.3f", pair_summary$fixed_overlap_correlation),
+      sprintf("%.3f", pair_summary$random_shared_weight),
+      sprintf("%.3f", pair_summary$random_total_weight_i),
+      sprintf("%.3f", pair_summary$random_total_weight_j),
+      sprintf("%.3f / sqrt(%.3f x %.3f)", pair_summary$random_shared_weight, pair_summary$random_total_weight_i, pair_summary$random_total_weight_j),
+      sprintf("%.3f", pair_summary$random_overlap_correlation)
+    )
+  )
+}
+
+for (i in seq_along(pair_order)) {
+  pair_id_value <- paste(pair_order[[i]], collapse = "_")
+  pair_label <- paste(ma_labels[pair_order[[i]][1]], "and", ma_labels[pair_order[[i]][2]])
+  cat("\n\n## Table S3.", i, ". ", pair_label, "\n\n", sep = "")
+  cat(knitr::kable(round_numeric(make_s3_pair_table(pair_id_value), 4), row.names = FALSE), sep = "\n")
+  cat("\n\nCalculation summary:\n\n")
+  cat(knitr::kable(make_s3_pair_summary(pair_id_value), row.names = FALSE), sep = "\n")
+}
+```
+
+# Validation Checks
+
+The following checks enforce alignment among the generated tables and supplemental appendices.
+
+```{r validation}
+validation_checks <- bind_rows(
+  make_check("Raw rows = 163", nrow(first_order_long_csv) == 163),
+  make_check("Reconciled IDs = 135", n_distinct(first_order_long_csv$common_id) == 135),
+  make_check("Overlapping IDs = 22", sum(id_membership$n_meta_analyses > 1) == 22),
+  make_check("Rows from overlapping IDs = 50", computed_counts$count[computed_counts$quantity == "Rows contributed by overlapping IDs"] == 50),
+  make_check("Duplicate rows due to overlap = 28", nrow(first_order_long_csv) - n_distinct(first_order_long_csv$common_id) == 28),
+  make_check("Table 3 rounded means match", all(round(table3_display$`FE Mean`, 3) == c(.556, .514, .766, .681)) && all(round(table3_display$`RE Mean`, 3) == c(.667, .575, 1.130, .663))),
+  make_check("Table 3 rounded SEs match", all(round(table3_display$`FE SE`, 3) == c(.022, .036, .064, .067)) && all(round(table3_display$`RE SE`, 3) == c(.073, .094, .402, .228))),
+  make_check("Table 3 Q, df, tau match", all(round(table3_display$Q, 2) == c(754.26, 183.77, 185.73, 131.19)) && all(table3_display$df == c(98, 32, 14, 15)) && all(round(table3_display$tau, 3) == c(.675, .479, 1.524, .868))),
+  make_check("Table 4 values match", all(round(table4_matrix, 3) == matrix(c(
+    1.000, .297, .162, .160,
+    .266, 1.000, .032, .120,
+    .160, .044, 1.000, .230,
+    .155, .131, .197, 1.000
+  ), nrow = 4, byrow = FALSE))),
+  make_check("Comprehensive CF matches", round(comprehensive_results_csv$mean[1], 3) == .575 && round(comprehensive_results_csv$SE_model[1], 3) == .019 && round(comprehensive_results_csv$Q[1], 2) == 1044.02 && comprehensive_results_csv$df[1] == 134),
+  make_check("Comprehensive CR matches", round(comprehensive_results_csv$mean[2], 3) == .699 && round(comprehensive_results_csv$SE_model[2], 3) == .069 && round(comprehensive_results_csv$tau[2], 3) == .756),
+  make_check("SOMAF rows have model SE only", all(abs(soma_recomputed$SE[soma_recomputed$source == "SOMAF"] - soma_recomputed$SE_model[soma_recomputed$source == "SOMAF"]) < 1e-10) && all(is.na(soma_recomputed$SE_KH[soma_recomputed$source == "SOMAF"])) && all(is.na(soma_recomputed$Q_star[soma_recomputed$source == "SOMAF"])) && all(is.na(soma_recomputed$q_KH[soma_recomputed$source == "SOMAF"]))),
+  make_check("SOMAR rows use modified KH", all(abs(soma_recomputed$SE[soma_recomputed$source == "SOMAR"] - soma_recomputed$SE_KH[soma_recomputed$source == "SOMAR"]) < 1e-10) && all(soma_recomputed$q_KH[soma_recomputed$source == "SOMAR"] >= 1) && all(abs(soma_recomputed$SE_KH[soma_recomputed$source == "SOMAR"] - soma_recomputed$SE_model[soma_recomputed$source == "SOMAR"] * sqrt(soma_recomputed$q_KH[soma_recomputed$source == "SOMAR"])) < 1e-10) && all(abs(soma_recomputed$q_KH[soma_recomputed$source == "SOMAR"] - pmax(1, soma_recomputed$Q_star[soma_recomputed$source == "SOMAR"] / soma_recomputed$df[soma_recomputed$source == "SOMAR"])) < 1e-10)),
+  make_check("Adjusted SOMAR q_KH values match", row_lookup(soma_recomputed, "FE-input / SOMAR adjusted")$q_KH == 1 && row_lookup(soma_recomputed, "RE-input / SOMAR adjusted")$q_KH == 1),
+  make_check("Naive SOFR q_KH rounds to 1.021", round(row_lookup(soma_recomputed, "FE-input / SOMAR naive")$q_KH, 3) == 1.021),
+  make_check("Table 5 rounded values match", {
+    target <- tibble(
+      row = c("CF", "CR", "SOFF", "SOFR", "SOFF(rho = 0.25)", "SOFR(rho = 0.25)", "Naive SOFF", "Naive SOFR", "SORF", "SORR", "SORF(rho = 0.25)", "SORR(rho = 0.25)", "Naive SORF", "Naive SORR"),
+      mean = c(.575, .699, .563, .615, .549, .550, .570, .617, .637, .637, .622, .622, .643, .643),
+      se = c(.019, .069, .020, .059, .021, .051, .017, .057, .064, .064, .063, .064, .055, .055),
+      QB = c(NA, NA, 13.98, 13.98, 17.60, 17.60, 14.89, 14.89, 2.20, 2.20, 2.55, 2.55, 2.11, 2.11),
+      tauB = c(NA, NA, NA, .103, NA, .008, NA, .102, NA, .000, NA, .013, NA, .000)
+    )
+    joined <- table5_numeric %>% select(row, `Mean ES`, SE, QB, tauB) %>% left_join(target, by = "row")
+    nrow(joined) == nrow(target) &&
+      identical(as.character(joined$row), as.character(target$row)) &&
+      check_rounded_with_na(joined$`Mean ES`, joined$mean, 3) &&
+      check_rounded_with_na(joined$SE, joined$se, 3) &&
+      check_rounded_with_na(joined$QB.x, joined$QB.y, 2) &&
+      check_rounded_with_na(joined$tauB.x, joined$tauB.y, 3)
+  }),
+  make_check("No stale SORF/SORR adjusted mean .639", round(row_lookup(soma_recomputed, "RE-input / SOMAF adjusted")$mean, 3) != .639 && round(row_lookup(soma_recomputed, "RE-input / SOMAR adjusted")$mean, 3) != .639),
+  make_check("No stale adjusted random-effects-input QB 2.25", round(row_lookup(soma_recomputed, "RE-input / SOMAF adjusted")$Q, 2) != 2.25 && round(row_lookup(soma_recomputed, "RE-input / SOMAR adjusted")$Q, 2) != 2.25),
+  make_check("No stale Naive SOFF mean .569", round(row_lookup(soma_recomputed, "FE-input / SOMAF naive")$mean, 3) != .569),
+  make_check("No stale SOFR rho=.25 values", round(row_lookup(rho25_results, "SOFR(rho = 0.25)")$mean, 3) != .609 && round(row_lookup(rho25_results, "SOFR(rho = 0.25)")$SE, 3) != .075 && round(row_lookup(rho25_results, "SOFR(rho = 0.25)")$tau, 3) != .102)
+)
+
+kable_clean(validation_checks, "Validation checks.", digits = 3)
+
+if (!all(validation_checks$passed %in% TRUE)) {
+  stop("Validation failed: ", paste(validation_checks$check[!validation_checks$passed], collapse = "; "))
+}
+```
+
+# Exported Files
+
+This section writes CSV files into the output directory. Optional DOCX tables are produced only when `export_docx: true` and Pandoc is available. The HTML report contains all tables regardless of this setting.
+
+```{r exports}
+csv_outputs <- c(
+  "01_first_order_effect_sizes_variances_weights_long.csv",
+  "00_count_reconciliation.csv",
+  "00_crosswalk_decisions.csv",
+  "02_table3_first_order_summaries.csv",
+  "03_pairwise_overlap_details.csv",
+  "04_pairwise_overlap_summary.csv",
+  "05_PP_FE_overlap_correlation_matrix.csv",
+  "06_PP_RE_overlap_correlation_matrix.csv",
+  "07_table4_lower_FE_upper_RE_overlap_matrix.csv",
+  "08_comprehensive_benchmark_data_135_rows.csv",
+  "09_comprehensive_benchmark_results.csv",
+  "10_soma_input_FE_first_order_summaries.csv",
+  "11_soma_input_RE_first_order_summaries.csv",
+  "12_soma_results_adjusted_and_naive.csv",
+  "13_table5_comprehensive_and_soma_results.csv",
+  "14_modified_KH_validation_checks.csv"
+)
+
+write_csv(first_order_long_csv, file.path(output_dir, "01_first_order_effect_sizes_variances_weights_long.csv"))
+write_csv(computed_counts, file.path(output_dir, "00_count_reconciliation.csv"))
+write_csv(crosswalk_decisions_csv, file.path(output_dir, "00_crosswalk_decisions.csv"))
+write_csv(first_order_recomputed, file.path(output_dir, "02_table3_first_order_summaries.csv"))
+write_csv(pairwise_details_recomputed, file.path(output_dir, "03_pairwise_overlap_details.csv"))
+write_csv(pairwise_recomputed, file.path(output_dir, "04_pairwise_overlap_summary.csv"))
+write_csv(as.data.frame(PP_FE) %>% rownames_to_column("meta_analysis"), file.path(output_dir, "05_PP_FE_overlap_correlation_matrix.csv"))
+write_csv(as.data.frame(PP_RE) %>% rownames_to_column("meta_analysis"), file.path(output_dir, "06_PP_RE_overlap_correlation_matrix.csv"))
+write_csv(as.data.frame(table4_matrix) %>% rownames_to_column("meta_analysis"), file.path(output_dir, "07_table4_lower_FE_upper_RE_overlap_matrix.csv"))
+write_csv(comprehensive_data_csv, file.path(output_dir, "08_comprehensive_benchmark_data_135_rows.csv"))
+write_csv(comprehensive_results_csv, file.path(output_dir, "09_comprehensive_benchmark_results.csv"))
+write_csv(soma_input_fe, file.path(output_dir, "10_soma_input_FE_first_order_summaries.csv"))
+write_csv(soma_input_re, file.path(output_dir, "11_soma_input_RE_first_order_summaries.csv"))
+write_csv(soma_recomputed, file.path(output_dir, "12_soma_results_adjusted_and_naive.csv"))
+write_csv(table5_numeric, file.path(output_dir, "13_table5_comprehensive_and_soma_results.csv"))
+write_csv(validation_checks, file.path(output_dir, "14_modified_KH_validation_checks.csv"))
+
+write_markdown_docx <- function(lines, output_file) {
+  if (!isTRUE(params$export_docx)) return(FALSE)
+  md_file <- sub("\\.docx$", ".md", output_file)
+  writeLines(lines, md_file, useBytes = TRUE)
+  if (rmarkdown::pandoc_available()) {
+    rmarkdown::pandoc_convert(md_file, to = "docx", output = output_file)
+    TRUE
+  } else {
+    FALSE
+  }
+}
+
+table_to_markdown <- function(df, digits = 3) {
+  paste(capture.output(knitr::kable(round_numeric(df, digits), format = "pipe", row.names = FALSE)), collapse = "\n")
+}
+
+docx_created <- c()
+docx_created["Table3"] <- write_markdown_docx(
+  c("# Table 3. First-order meta-analysis summaries", "", table_to_markdown(table3_display, 3)),
+  file.path(output_dir, "Table3_empirical_application.docx")
+)
+docx_created["Table4"] <- write_markdown_docx(
+  c("# Table 4. Overlap-correlation matrix", "", table_to_markdown(table4_display, 3)),
+  file.path(output_dir, "Table4_empirical_application.docx")
+)
+docx_created["Table5"] <- write_markdown_docx(
+  c("# Table 5. Empirical application results", "", table_to_markdown(table5_display, 3)),
+  file.path(output_dir, "Table5_empirical_application.docx")
+)
+
+s2_first_order_lines <- c(
+  "# Supplementary Appendix S2: First-Order Effect-Size, Variance, and Weight Tables",
+  "",
+  "These tables list the coded effect sizes used in each of the four first-order meta-analyses in the empirical application. The column Common ID is shared across tables: the same number denotes the same reconciled primary-study/effect-size entry when it appears in more than one first-order meta-analysis. Fixed-effect weights are inverse-variance weights, and random-effects weights are inverse-variance weights after adding the first-order tau-squared estimate for the corresponding meta-analysis.",
+  "",
+  table_to_markdown(appendix_s2_reconciliation, 3)
+)
+for (i in seq_along(ma_order)) {
+  ma <- ma_order[i]
+  s2_first_order_lines <- c(
+    s2_first_order_lines,
+    "",
+    paste0("## Table S2.", i, ". ", ma_labels[ma]),
+    "",
+    table_to_markdown(make_s2_table(ma), 4),
+    "",
+    "Summary line:",
+    "",
+    table_to_markdown(make_s2_summary(ma), 4)
+  )
+}
+docx_created["S2"] <- write_markdown_docx(s2_first_order_lines, file.path(output_dir, "Supplementary_Appendix_S2_first_order_tables.docx"))
+
+s3_pairwise_lines <- c(
+  "# Supplementary Appendix S3: Pairwise Overlap Correlations Among First-Order Meta-Analyses",
+  "",
+  "This appendix shows how the pairwise correlations among first-order meta-analytic estimates were obtained. Each section corresponds to one pair of meta-analyses. The row-level table lists only overlapping primary-study/effect-size entries, using the same Common ID as Supplementary Appendix S2. For each overlapping entry, the table gives the effect size, variance, fixed-effect weight, and random-effects weight as coded in each meta-analysis. The final columns give the shared-weight contribution used for the fixed-effect and random-effects overlap correlations.",
+  "",
+  table_to_markdown(appendix_s3_overview, 3)
+)
+for (i in seq_along(pair_order)) {
+  pair_id_value <- paste(pair_order[[i]], collapse = "_")
+  pair_label <- paste(ma_labels[pair_order[[i]][1]], "and", ma_labels[pair_order[[i]][2]])
+  s3_pairwise_lines <- c(
+    s3_pairwise_lines,
+    "",
+    paste0("## Table S3.", i, ". ", pair_label),
+    "",
+    table_to_markdown(make_s3_pair_table(pair_id_value), 4),
+    "",
+    "Calculation summary:",
+    "",
+    table_to_markdown(make_s3_pair_summary(pair_id_value), 3)
+  )
+}
+docx_created["S3"] <- write_markdown_docx(s3_pairwise_lines, file.path(output_dir, "Supplementary_Appendix_S3_pairwise_overlap_tables.docx"))
+
+export_summary <- tibble(
+  output = c(
+    csv_outputs,
+    "Table3_empirical_application.docx",
+    "Table4_empirical_application.docx",
+    "Table5_empirical_application.docx",
+    "Supplementary_Appendix_S2_first_order_tables.docx",
+    "Supplementary_Appendix_S3_pairwise_overlap_tables.docx"
+  ),
+  status = c(rep("written as generated CSV", length(csv_outputs)), ifelse(docx_created, "written as DOCX", "DOCX not requested or Pandoc unavailable"))
+)
+
+kable_clean(export_summary, "Export summary.")
+```
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), file.path(output_dir, "sessionInfo.txt"))
+loaded_packages <- sort(loadedNamespaces())
+write_csv(tibble(
+  package = loaded_packages,
+  version = vapply(loaded_packages, function(p) as.character(packageVersion(p)), character(1))
+), file.path(output_dir, "package_versions.csv"))
+```
+
+```{r final-message}
+cat("All validation checks passed.\n")
+```
+
+
