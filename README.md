@@ -13,3 +13,5 @@ The `empirical-example` folder contains the code, workbook, and analysis needed 
 # Status
 
 The accompanying manuscript is currently under review for journal publication. Code and documentation may continue to evolve during the review process. Reach out to Gracie Hayes with any questions about this repository ([gshayes\@u.northwestern.edu](mailto:gshayes@u.northwestern.edu)).
+
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23218461.svg)](https://doi.org/10.5281/zenodo.23218461)
